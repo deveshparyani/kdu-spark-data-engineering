@@ -1,0 +1,189 @@
+# Viewstack ETL config for client gamma.
+# Upload this file to:
+# s3://<data-lake-bucket>/configs/client=gamma/v1.yaml
+#
+# Expected raw file:
+# - raw/client=gamma/file_type=sales/creator_gamma_sales.csv
+
+pipeline:
+  name: viewstack
+  schema_version: v1
+
+client:
+  id: gamma
+  description: "Sales-only client with cleaning and aggregation, no lookup join."
+
+source_format: csv
+partition_column: date
+date_column: date
+
+rename_columns:
+  Date: date_raw
+  Id: id
+  DiscountCode: discount_code
+  Revenue: revenue_raw
+  NewOrders: new_orders_raw
+  LapsedOrders: lapsed_orders_raw
+  ActiveOrders: active_orders_raw
+
+cleaning_rules:
+  discount_code: lowercase
+
+transformations:
+  cast_columns: {}
+  fill_nulls:
+    new_orders_raw: 0
+    lapsed_orders_raw: 0
+    active_orders_raw: 0
+  derived_columns:
+    - name: date
+      expression: >
+        COALESCE(
+          to_date(date_raw, 'yyyy-MM-dd'),
+          to_date(date_raw, 'MM/dd/yyyy'),
+          to_date(date_raw, 'M/d/yyyy'),
+          to_date(date_raw, 'dd-MM-yyyy'),
+          to_date(date_raw, 'dd/MM/yyyy'),
+          to_date(date_raw)
+        )
+    - name: revenue
+      expression: "CAST(regexp_replace(trim(revenue_raw), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: new_orders
+      expression: "CAST(regexp_replace(trim(COALESCE(new_orders_raw, '0')), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: lapsed_orders
+      expression: "CAST(regexp_replace(trim(COALESCE(lapsed_orders_raw, '0')), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: active_orders
+      expression: "CAST(regexp_replace(trim(COALESCE(active_orders_raw, '0')), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: orders
+      expression: "COALESCE(new_orders, 0) + COALESCE(lapsed_orders, 0) + COALESCE(active_orders, 0)"
+    - name: client_id
+      expression: "'gamma'"
+  filter_expressions:
+    - "date IS NOT NULL"
+    - "id IS NOT NULL"
+
+drop_columns: []
+
+aggregation:
+  group_by:
+    - date
+    - discount_code
+  metrics:
+    - column: revenue
+      function: sum
+      alias: revenue
+    - column: new_orders
+      function: sum
+      alias: new_orders
+    - column: lapsed_orders
+      function: sum
+      alias: lapsed_orders
+    - column: active_orders
+      function: sum
+      alias: active_orders
+
+gold_aggregations:
+  group_by:
+    - date
+    - discount_code
+  metrics:
+    - column: revenue
+      function: sum
+      alias: revenue
+    - column: new_orders
+      function: sum
+      alias: new_orders
+    - column: lapsed_orders
+      function: sum
+      alias: lapsed_orders
+    - column: active_orders
+      function: sum
+      alias: active_orders
+
+common_cleaning:
+  date_parsing_rules:
+    target_column: date
+    accepted_formats:
+      - yyyy-MM-dd
+      - MM/dd/yyyy
+      - M/d/yyyy
+      - dd-MM-yyyy
+      - dd/MM/yyyy
+  numeric_cleaning:
+    target_columns:
+      - revenue_raw
+      - new_orders_raw
+      - lapsed_orders_raw
+      - active_orders_raw
+    remove_currency_symbols: true
+    remove_thousands_separators: true
+    normalize_decimal_separator: "."
+  text_normalization:
+    trim_columns:
+      - id
+      - discount_code
+    lowercase_columns:
+      - discount_code
+  missing_value_strategy:
+    drop_rows_when_missing:
+      - date_raw
+      - id
+    fill_defaults:
+      new_orders_raw: 0
+      lapsed_orders_raw: 0
+      active_orders_raw: 0
+
+quarantine_rules: []
+
+post_processing:
+  column_renaming:
+    date: date
+    client_id: client_id
+    revenue: revenue
+    orders: orders
+    discount_code: discount_code
+  sorting_rules:
+    - column: date
+      direction: asc
+    - column: discount_code
+      direction: asc
+  filtering_rules:
+    - "discount_code IS NOT NULL"
+
+outputs:
+  loaded_path: "s3://<data-lake-bucket>/processed/client=gamma/"
+  quarantine_path: "s3://<data-lake-bucket>/quarantine/client=gamma/"
+  loaded_schema:
+    - name: date
+      type: date
+    - name: discount_code
+      type: string
+    - name: revenue
+      type: double
+    - name: new_orders
+      type: double
+    - name: lapsed_orders
+      type: double
+    - name: active_orders
+      type: double
+    - name: client_id
+      type: string
+  quarantine_schema:
+    - name: date
+      type: string
+    - name: id
+      type: string
+    - name: discount_code
+      type: string
+    - name: revenue
+      type: string
+    - name: new_orders
+      type: string
+    - name: lapsed_orders
+      type: string
+    - name: active_orders
+      type: string
+    - name: quarantine_reason
+      type: string
+    - name: client_id
+      type: string

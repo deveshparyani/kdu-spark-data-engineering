@@ -103,14 +103,17 @@ resource "aws_iam_role_policy" "lambda_upload" {
         Resource = var.bucket_arn
       },
       {
-        Sid    = "UseIdempotencyTable"
+        Sid    = "UseIngestionTables"
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:UpdateItem"
         ]
-        Resource = var.dynamodb_table_arn
+        Resource = [
+          var.dynamodb_table_arn,
+          var.readiness_table_arn
+        ]
       },
       {
         Sid    = "ConsumeIngestionQueue"
