@@ -32,7 +32,15 @@ REQUIRED_ARGS = [
     "STAGING_TABLE_NAME",
 ]
 
-DEDUP_KEYS = ["client", "date", "discount_code", "show"]
+DEDUP_KEYS = [
+    "client",
+    "date",
+    "discount_code",
+    "show",
+    "campaign_name",
+    "campaign_item_id",
+    "client_name",
+]
 MAX_INVALID_RATIO = 0.10
 SEGMENT_COLUMNS = ["new_orders", "lapsed_orders", "active_orders"]
 
@@ -160,12 +168,31 @@ def derive_orders_if_needed(dataframe, aliases):
     return dataframe
 
 
-def resolve_filter_column(dataframe):
-    if "partition_date" in dataframe.columns:
-        return "partition_date"
-    if "date" in dataframe.columns:
-        return "date"
-    raise GoldJobError("missing_date_filter_column")
+def derive_ratio_metrics(dataframe):
+    return (
+        dataframe
+        .withColumn(
+            "revenue_per_order",
+            F.when(
+                F.col("orders").isNull() | (F.col("orders") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("revenue") / F.col("orders"))
+        )
+        .withColumn(
+            "revenue_per_impression",
+            F.when(
+                F.col("impressions").isNull() | (F.col("impressions") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("revenue") / F.col("impressions"))
+        )
+        .withColumn(
+            "impressions_per_order",
+            F.when(
+                F.col("orders").isNull() | (F.col("orders") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("impressions") / F.col("orders"))
+        )
+    )
 
 
 def quarantine_rows(dataframe, target_uri):
@@ -176,11 +203,7 @@ def quarantine_rows(dataframe, target_uri):
     if count == 0:
         return 0
 
-    (
-        dataframe.write.mode("overwrite")
-        .format("parquet")
-        .save(target_uri)
-    )
+    dataframe.write.mode("overwrite").format("parquet").save(target_uri)
     return count
 
 
@@ -222,6 +245,33 @@ def invalid_reason_expression(aliases):
         )
 
     return expr.otherwise(F.lit("data_quality_failure"))
+
+
+def load_current_run_rows(dataframe):
+    filtered = dataframe.filter(
+        (F.col("client") == JOB_CONTEXT["client"])
+        & (F.col("file_hash") == JOB_CONTEXT["file_hash"])
+    )
+
+    count = filtered.count()
+    emit_log("gold_run_scope", scope="client_and_file_hash", rows=count)
+
+    if count > 0:
+        return filtered
+
+    emit_log("gold_run_scope_fallback", reason="file_hash_rows_not_found")
+
+    if "start_date" in dataframe.columns and "end_date" in dataframe.columns:
+        fallback = dataframe.filter(
+            (F.col("client") == JOB_CONTEXT["client"])
+            & (F.to_date(F.col("start_date")) == F.to_date(F.lit(JOB_CONTEXT["start_date"])))
+            & (F.to_date(F.col("end_date")) == F.to_date(F.lit(JOB_CONTEXT["end_date"])))
+        )
+        fallback_count = fallback.count()
+        emit_log("gold_run_scope", scope="client_start_end_date", rows=fallback_count)
+        return fallback
+
+    return filtered
 
 
 args = getResolvedOptions(sys.argv, REQUIRED_ARGS)
@@ -270,17 +320,20 @@ try:
         ],
     )
 
-    dataframe = spark.read.parquet(args["PROCESSED_S3_URI"]).filter(F.col("client") == args["CLIENT"])
-    filter_column = resolve_filter_column(dataframe)
-    dataframe = dataframe.filter(
-        (F.to_date(F.col(filter_column)) >= F.to_date(F.lit(args["START_DATE"])))
-        & (F.to_date(F.col(filter_column)) <= F.to_date(F.lit(args["END_DATE"])))
-    )
+    dataframe = spark.read.parquet(args["PROCESSED_S3_URI"])
+
+    if "year" in dataframe.columns and "month" in dataframe.columns and "day" in dataframe.columns and "date" not in dataframe.columns:
+        dataframe = dataframe.withColumn(
+            "date",
+            F.to_date(F.concat_ws("-", "year", "month", "day"))
+        )
+
+    dataframe = load_current_run_rows(dataframe)
 
     pre_aggregate_rows = dataframe.count()
     emit_log("gold_input_rows", rows=pre_aggregate_rows)
     if pre_aggregate_rows == 0:
-        raise GoldJobError("no_rows_for_requested_client_date_range")
+        raise GoldJobError("no_rows_for_current_run")
 
     validate_aggregation_inputs(dataframe, group_by_columns, metrics)
     aggregations = build_aggregations(metrics)
@@ -298,12 +351,21 @@ try:
             "show": "string",
             "orders": "double",
             "revenue": "double",
+            "impressions": "double",
+            "sub_shipments": "double",
             "new_orders": "double",
             "lapsed_orders": "double",
             "active_orders": "double",
+            "revenue_per_order": "double",
+            "revenue_per_impression": "double",
+            "impressions_per_order": "double",
+            "campaign_name": "string",
+            "campaign_item_id": "string",
+            "client_name": "string",
         },
     )
     dataframe = derive_orders_if_needed(dataframe, aliases)
+    dataframe = derive_ratio_metrics(dataframe)
 
     dataframe = attach_metadata(dataframe)
     dataframe = add_partition_columns(dataframe)
@@ -319,7 +381,10 @@ try:
 
     deduplicated = dataframe.dropDuplicates(DEDUP_KEYS)
     invalid_condition = build_invalid_condition(deduplicated, aliases)
-    invalid_rows = deduplicated.filter(invalid_condition).withColumn("dq_reason", invalid_reason_expression(aliases))
+    invalid_rows = deduplicated.filter(invalid_condition).withColumn(
+        "dq_reason",
+        invalid_reason_expression(aliases)
+    )
 
     quarantine_df = duplicate_rows.unionByName(invalid_rows, allowMissingColumns=True).dropDuplicates(
         DEDUP_KEYS + ["dq_reason"]
@@ -328,6 +393,64 @@ try:
 
     valid_rows = deduplicated.filter(~invalid_condition)
     valid_rows = add_partition_columns(valid_rows)
+
+    valid_rows = (
+        valid_rows
+        .withColumn("date", F.to_date(F.col("date")))
+        .withColumn("discount_code", F.col("discount_code").cast("string"))
+        .withColumn("orders", F.col("orders").cast("double"))
+        .withColumn("revenue", F.col("revenue").cast("double"))
+        .withColumn("show", F.col("show").cast("string"))
+        .withColumn("impressions", F.col("impressions").cast("double"))
+        .withColumn("sub_shipments", F.col("sub_shipments").cast("double"))
+        .withColumn("new_orders", F.col("new_orders").cast("double"))
+        .withColumn("lapsed_orders", F.col("lapsed_orders").cast("double"))
+        .withColumn("active_orders", F.col("active_orders").cast("double"))
+        .withColumn("revenue_per_order", F.col("revenue_per_order").cast("double"))
+        .withColumn("revenue_per_impression", F.col("revenue_per_impression").cast("double"))
+        .withColumn("impressions_per_order", F.col("impressions_per_order").cast("double"))
+        .withColumn("campaign_name", F.col("campaign_name").cast("string"))
+        .withColumn("campaign_item_id", F.col("campaign_item_id").cast("string"))
+        .withColumn("client_name", F.col("client_name").cast("string"))
+        .withColumn("file_type", F.col("file_type").cast("string"))
+        .withColumn("file_hash", F.col("file_hash").cast("string"))
+        .withColumn("config_version", F.col("config_version").cast("string"))
+        .withColumn("ingest_date", F.to_date(F.col("ingest_date")))
+        .withColumn("start_date", F.to_date(F.col("start_date")))
+        .withColumn("end_date", F.to_date(F.col("end_date")))
+        .withColumn("data_date", F.to_date(F.col("data_date")))
+        .withColumn("curated_at", F.col("curated_at").cast("timestamp"))
+        .select(
+            "date",
+            "discount_code",
+            "orders",
+            "revenue",
+            "show",
+            "impressions",
+            "sub_shipments",
+            "new_orders",
+            "lapsed_orders",
+            "active_orders",
+            "revenue_per_order",
+            "revenue_per_impression",
+            "impressions_per_order",
+            "campaign_name",
+            "campaign_item_id",
+            "client_name",
+            "file_type",
+            "file_hash",
+            "config_version",
+            "ingest_date",
+            "start_date",
+            "end_date",
+            "data_date",
+            "curated_at",
+            "client",
+            "year",
+            "month",
+            "day",
+        )
+    )
     valid_count = valid_rows.count()
 
     invalid_ratio = 0.0 if total_rows == 0 else quarantine_count / float(total_rows)
