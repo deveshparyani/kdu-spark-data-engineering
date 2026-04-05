@@ -10,6 +10,7 @@ locals {
   names = {
     data_lake_bucket      = local.bucket_name
     idempotency_table     = "${var.project_name}-dynamodb-idempotency-${var.environment}"
+    readiness_table       = "${var.project_name}-dynamodb-readiness-${var.environment}"
     lock_table            = "${var.project_name}-lock-table"
     upload_lambda         = "${var.project_name}-lambda-upload-trigger-${var.environment}"
     adscribe_lambda       = "${var.project_name}-lambda-adscribe-ingestion-${var.environment}"
@@ -98,6 +99,16 @@ module "dynamodb" {
   tags                   = local.common_tags
 }
 
+module "readiness_table" {
+  source = "./modules/dynamodb"
+
+  table_name             = local.names.readiness_table
+  hash_key_name          = "batch_key"
+  alarm_actions          = var.alert_email == "" ? [] : [aws_sns_topic.alerts[0].arn]
+  point_in_time_recovery = true
+  tags                   = local.common_tags
+}
+
 module "lock_table" {
   source = "./modules/dynamodb"
 
@@ -139,6 +150,7 @@ module "iam" {
   scripts_prefix               = var.scripts_prefix
   temp_prefix                  = var.temp_prefix
   dynamodb_table_arn           = module.dynamodb.table_arn
+  readiness_table_arn          = module.readiness_table.table_arn
   lock_table_arn               = module.lock_table.table_arn
   ingestion_queue_arn          = module.sqs_ingestion.queue_arn
   upload_lambda_name           = local.names.upload_lambda
@@ -287,6 +299,7 @@ module "lambda_upload_processor" {
   sqs_max_concurrency             = var.ingestion_queue_max_concurrency
   environment_variables = {
     IDEMPOTENCY_TABLE      = module.dynamodb.table_name
+    READINESS_TABLE        = module.readiness_table.table_name
     STATE_MACHINE_ARN      = module.step_function.state_machine_arn
     RAW_PREFIX             = var.raw_prefix
     PROCESSED_PREFIX       = var.processed_prefix
