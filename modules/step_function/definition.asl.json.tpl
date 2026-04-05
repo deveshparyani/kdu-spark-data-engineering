@@ -88,6 +88,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
+          "ResultPath": "$.failure",
           "Next": "PipelineFailed"
         }
       ],
@@ -112,7 +113,6 @@
           "--DATA_DATE.$": "$.metadata.data_date"
         }
       },
-      "ResultPath": "$.silver_job",
       "Retry": [
         {
           "ErrorEquals": [
@@ -130,9 +130,11 @@
           "ErrorEquals": [
             "States.ALL"
           ],
+          "ResultPath": "$.failure",
           "Next": "ReleaseDistributedLockOnFailure"
         }
       ],
+      "ResultPath": "$.silver_result",
       "Next": "RunGoldJob"
     },
     "RunGoldJob": {
@@ -157,7 +159,6 @@
           "--STAGING_TABLE_NAME.$": "$.execution.staging_table_name"
         }
       },
-      "ResultPath": "$.gold_job",
       "Retry": [
         {
           "ErrorEquals": [
@@ -175,215 +176,40 @@
           "ErrorEquals": [
             "States.ALL"
           ],
+          "ResultPath": "$.failure",
           "Next": "ReleaseDistributedLockOnFailure"
         }
       ],
-      "Next": "CreateStagingTable"
+      "ResultPath": "$.gold_result",
+      "Next": "RunRedshiftLoad"
     },
-    "CreateStagingTable": {
+    "RunRedshiftLoad": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "Database": "${redshift_database}",
-        "SecretArn": "${redshift_secret_arn}",
-        "WorkgroupName": "${redshift_workgroup_name}",
-        "Sql.$": "States.Format('CREATE TABLE IF NOT EXISTS {} (LIKE ${redshift_target_table});', $.execution.staging_table_name)"
+        "FunctionName": "${redshift_loader_lambda_arn}",
+        "Payload": {
+          "database": "${redshift_database}",
+          "workgroup_name": "${redshift_workgroup_name}",
+          "secret_arn": "${redshift_secret_arn}",
+          "staging_table_name.$": "$.execution.staging_table_name",
+          "target_table": "${redshift_target_table}",
+          "redshift_copy_source.$": "$.redshift_copy_source",
+          "copy_role_arn": "${copy_role_arn}",
+          "client.$": "$.metadata.client"
+        }
       },
-      "ResultPath": "$.create_stage",
+      "ResultPath": "$.redshift_result",
       "Catch": [
         {
           "ErrorEquals": [
             "States.ALL"
           ],
+          "ResultPath": "$.failure",
           "Next": "ReleaseDistributedLockOnFailure"
-        }
-      ],
-      "Next": "WaitForCreateStage"
-    },
-    "WaitForCreateStage": {
-      "Type": "Wait",
-      "Seconds": 10,
-      "Next": "CheckCreateStageStatus"
-    },
-    "CheckCreateStageStatus": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
-      "Parameters": {
-        "Id.$": "$.create_stage.Id"
-      },
-      "ResultPath": "$.create_stage_status",
-      "Next": "CreateStageCompleted?"
-    },
-    "CreateStageCompleted?": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.create_stage_status.Status",
-          "StringEquals": "FINISHED",
-          "Next": "CopyToStaging"
-        },
-        {
-          "Variable": "$.create_stage_status.Status",
-          "StringEquals": "FAILED",
-          "Next": "DropStagingTableOnFailure"
-        },
-        {
-          "Variable": "$.create_stage_status.Status",
-          "StringEquals": "ABORTED",
-          "Next": "DropStagingTableOnFailure"
-        }
-      ],
-      "Default": "WaitForCreateStage"
-    },
-    "CopyToStaging": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
-      "Parameters": {
-        "Database": "${redshift_database}",
-        "SecretArn": "${redshift_secret_arn}",
-        "WorkgroupName": "${redshift_workgroup_name}",
-        "Sql.$": "States.Format('COPY {} FROM \\'{}\\' IAM_ROLE \\'${copy_role_arn}\\' FORMAT AS PARQUET TIMEFORMAT \\'auto\\' STATUPDATE ON;', $.execution.staging_table_name, $.redshift_copy_source)"
-      },
-      "ResultPath": "$.copy_stage",
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "DropStagingTableOnFailure"
-        }
-      ],
-      "Next": "WaitForCopyStage"
-    },
-    "WaitForCopyStage": {
-      "Type": "Wait",
-      "Seconds": 20,
-      "Next": "CheckCopyStageStatus"
-    },
-    "CheckCopyStageStatus": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
-      "Parameters": {
-        "Id.$": "$.copy_stage.Id"
-      },
-      "ResultPath": "$.copy_stage_status",
-      "Next": "CopyStageCompleted?"
-    },
-    "CopyStageCompleted?": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.copy_stage_status.Status",
-          "StringEquals": "FINISHED",
-          "Next": "MergeIntoFactTable"
-        },
-        {
-          "Variable": "$.copy_stage_status.Status",
-          "StringEquals": "FAILED",
-          "Next": "DropStagingTableOnFailure"
-        },
-        {
-          "Variable": "$.copy_stage_status.Status",
-          "StringEquals": "ABORTED",
-          "Next": "DropStagingTableOnFailure"
-        }
-      ],
-      "Default": "WaitForCopyStage"
-    },
-    "MergeIntoFactTable": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
-      "Parameters": {
-        "Database": "${redshift_database}",
-        "SecretArn": "${redshift_secret_arn}",
-        "WorkgroupName": "${redshift_workgroup_name}",
-        "Sqls.$": "States.Array('BEGIN;', States.Format('DELETE FROM ${redshift_target_table} WHERE client = \\'{}\\' AND date BETWEEN \\'{}\\' AND \\'{}\\';', $.metadata.client, $.metadata.start_date, $.metadata.end_date), States.Format('INSERT INTO ${redshift_target_table} SELECT * FROM {} WHERE client = \\'{}\\' AND date BETWEEN \\'{}\\' AND \\'{}\\';', $.execution.staging_table_name, $.metadata.client, $.metadata.start_date, $.metadata.end_date), 'COMMIT;')"
-      },
-      "ResultPath": "$.redshift_merge",
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "DropStagingTableOnFailure"
-        }
-      ],
-      "Next": "WaitForMerge"
-    },
-    "WaitForMerge": {
-      "Type": "Wait",
-      "Seconds": 20,
-      "Next": "CheckMergeStatus"
-    },
-    "CheckMergeStatus": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
-      "Parameters": {
-        "Id.$": "$.redshift_merge.Id"
-      },
-      "ResultPath": "$.redshift_merge_status",
-      "Next": "MergeCompleted?"
-    },
-    "MergeCompleted?": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.redshift_merge_status.Status",
-          "StringEquals": "FINISHED",
-          "Next": "DropStagingTable"
-        },
-        {
-          "Variable": "$.redshift_merge_status.Status",
-          "StringEquals": "FAILED",
-          "Next": "DropStagingTableOnFailure"
-        },
-        {
-          "Variable": "$.redshift_merge_status.Status",
-          "StringEquals": "ABORTED",
-          "Next": "DropStagingTableOnFailure"
-        }
-      ],
-      "Default": "WaitForMerge"
-    },
-    "DropStagingTable": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
-      "Parameters": {
-        "Database": "${redshift_database}",
-        "SecretArn": "${redshift_secret_arn}",
-        "WorkgroupName": "${redshift_workgroup_name}",
-        "Sql.$": "States.Format('DROP TABLE IF EXISTS {};', $.execution.staging_table_name)"
-      },
-      "ResultPath": "$.drop_stage",
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "ReleaseDistributedLock"
         }
       ],
       "Next": "ReleaseDistributedLock"
-    },
-    "DropStagingTableOnFailure": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
-      "Parameters": {
-        "Database": "${redshift_database}",
-        "SecretArn": "${redshift_secret_arn}",
-        "WorkgroupName": "${redshift_workgroup_name}",
-        "Sql.$": "States.Format('DROP TABLE IF EXISTS {};', $.execution.staging_table_name)"
-      },
-      "ResultPath": "$.drop_stage_failure",
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "ReleaseDistributedLockOnFailure"
-        }
-      ],
-      "Next": "ReleaseDistributedLockOnFailure"
     },
     "ReleaseDistributedLock": {
       "Type": "Task",

@@ -98,6 +98,11 @@ variable "config_validator_lambda_name" {
   type        = string
 }
 
+variable "redshift_loader_lambda_name" {
+  description = "Redshift loader Lambda name."
+  type        = string
+}
+
 variable "state_machine_name" {
   description = "Step Functions state machine name."
   type        = string
@@ -135,6 +140,11 @@ variable "lambda_adscribe_role_name" {
 
 variable "lambda_validator_role_name" {
   description = "IAM role name for the config validator Lambda."
+  type        = string
+}
+
+variable "lambda_redshift_loader_role_name" {
+  description = "IAM role name for the Redshift loader Lambda."
   type        = string
 }
 

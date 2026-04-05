@@ -15,6 +15,7 @@ locals {
     upload_lambda         = "${var.project_name}-lambda-upload-trigger-${var.environment}"
     adscribe_lambda       = "${var.project_name}-lambda-adscribe-ingestion-${var.environment}"
     config_validator      = "${var.project_name}-config-validator"
+    redshift_loader       = "${var.project_name}-lambda-redshift-loader-${var.environment}"
     silver_glue_job       = "${var.project_name}-glue-job-silver-${var.environment}"
     gold_glue_job         = "${var.project_name}-glue-job-gold-${var.environment}"
     state_machine         = coalesce(var.step_function_name_override, "${var.project_name}-step-function-orchestrator-${var.environment}")
@@ -28,6 +29,7 @@ locals {
     lambda_upload_role    = "${var.project_name}-iam-lambda-upload-${var.environment}"
     lambda_adscribe_role  = "${var.project_name}-iam-lambda-adscribe-${var.environment}"
     lambda_validator_role = "${var.project_name}-iam-lambda-config-validator-${var.environment}"
+    lambda_loader_role    = "${var.project_name}-iam-lambda-redshift-loader-${var.environment}"
     glue_role             = "${var.project_name}-iam-glue-${var.environment}"
     step_function_role    = "${var.project_name}-iam-step-functions-${var.environment}"
     redshift_copy_role    = "${var.project_name}-iam-redshift-copy-${var.environment}"
@@ -136,38 +138,40 @@ module "sqs_ingestion" {
 module "iam" {
   source = "./modules/iam"
 
-  project_name                 = var.project_name
-  environment                  = var.environment
-  region                       = data.aws_region.current.region
-  account_id                   = data.aws_caller_identity.current.account_id
-  bucket_name                  = module.s3.bucket_name
-  bucket_arn                   = module.s3.bucket_arn
-  raw_prefix                   = var.raw_prefix
-  processed_prefix             = var.processed_prefix
-  curated_prefix               = var.curated_prefix
-  quarantine_prefix            = var.quarantine_prefix
-  configs_prefix               = var.configs_prefix
-  scripts_prefix               = var.scripts_prefix
-  temp_prefix                  = var.temp_prefix
-  dynamodb_table_arn           = module.dynamodb.table_arn
-  readiness_table_arn          = module.readiness_table.table_arn
-  lock_table_arn               = module.lock_table.table_arn
-  ingestion_queue_arn          = module.sqs_ingestion.queue_arn
-  upload_lambda_name           = local.names.upload_lambda
-  adscribe_lambda_name         = local.names.adscribe_lambda
-  config_validator_lambda_name = local.names.config_validator
-  state_machine_name           = local.names.state_machine
-  glue_job_names               = [local.names.silver_glue_job, local.names.gold_glue_job]
-  redshift_workgroup_name      = local.names.redshift_workgroup
-  adscribe_secret_name         = local.names.adscribe_secret
-  redshift_secret_name         = local.names.redshift_admin_secret
-  lambda_upload_role_name      = local.names.lambda_upload_role
-  lambda_adscribe_role_name    = local.names.lambda_adscribe_role
-  lambda_validator_role_name   = local.names.lambda_validator_role
-  glue_role_name               = local.names.glue_role
-  step_function_role_name      = local.names.step_function_role
-  redshift_copy_role_name      = local.names.redshift_copy_role
-  tags                         = local.common_tags
+  project_name                     = var.project_name
+  environment                      = var.environment
+  region                           = data.aws_region.current.region
+  account_id                       = data.aws_caller_identity.current.account_id
+  bucket_name                      = module.s3.bucket_name
+  bucket_arn                       = module.s3.bucket_arn
+  raw_prefix                       = var.raw_prefix
+  processed_prefix                 = var.processed_prefix
+  curated_prefix                   = var.curated_prefix
+  quarantine_prefix                = var.quarantine_prefix
+  configs_prefix                   = var.configs_prefix
+  scripts_prefix                   = var.scripts_prefix
+  temp_prefix                      = var.temp_prefix
+  dynamodb_table_arn               = module.dynamodb.table_arn
+  readiness_table_arn              = module.readiness_table.table_arn
+  lock_table_arn                   = module.lock_table.table_arn
+  ingestion_queue_arn              = module.sqs_ingestion.queue_arn
+  upload_lambda_name               = local.names.upload_lambda
+  adscribe_lambda_name             = local.names.adscribe_lambda
+  config_validator_lambda_name     = local.names.config_validator
+  state_machine_name               = local.names.state_machine
+  glue_job_names                   = [local.names.silver_glue_job, local.names.gold_glue_job]
+  redshift_workgroup_name          = local.names.redshift_workgroup
+  adscribe_secret_name             = local.names.adscribe_secret
+  redshift_secret_name             = local.names.redshift_admin_secret
+  lambda_upload_role_name          = local.names.lambda_upload_role
+  lambda_adscribe_role_name        = local.names.lambda_adscribe_role
+  lambda_validator_role_name       = local.names.lambda_validator_role
+  lambda_redshift_loader_role_name = local.names.lambda_loader_role
+  redshift_loader_lambda_name      = local.names.redshift_loader
+  glue_role_name                   = local.names.glue_role
+  step_function_role_name          = local.names.step_function_role
+  redshift_copy_role_name          = local.names.redshift_copy_role
+  tags                             = local.common_tags
 }
 
 module "redshift" {
@@ -272,6 +276,7 @@ module "step_function" {
   redshift_target_table       = var.default_redshift_table
   redshift_staging_table      = var.redshift_staging_table
   copy_role_arn               = module.iam.redshift_copy_role_arn
+  redshift_loader_lambda_arn  = module.lambda_redshift_loader.function_arn
   quarantine_prefix           = var.quarantine_prefix
   alarm_actions               = var.alert_email == "" ? [] : [aws_sns_topic.alerts[0].arn]
   tags                        = local.common_tags
@@ -336,6 +341,25 @@ module "lambda_adscribe_ingestion" {
     RAW_PREFIX          = var.raw_prefix
   }
   tags = local.common_tags
+}
+
+module "lambda_redshift_loader" {
+  source = "./modules/lambda"
+
+  function_name                  = local.names.redshift_loader
+  description                    = "Creates Redshift staging tables, copies curated parquet, merges into the fact table, and drops the staging table."
+  source_dir                     = "${path.root}/src/lambda/redshift_loader"
+  handler                        = "handler.lambda_handler"
+  runtime                        = var.lambda_runtime
+  role_arn                       = module.iam.lambda_redshift_loader_role_arn
+  timeout                        = 900
+  memory_size                    = var.lambda_memory_size_mb
+  architectures                  = var.lambda_architectures
+  reserved_concurrent_executions = null
+  log_retention_days             = var.log_retention_days
+  alarm_actions                  = var.alert_email == "" ? [] : [aws_sns_topic.alerts[0].arn]
+  environment_variables          = {}
+  tags                           = local.common_tags
 }
 
 module "eventbridge" {

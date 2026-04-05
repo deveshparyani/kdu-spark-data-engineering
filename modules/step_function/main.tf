@@ -19,6 +19,7 @@ resource "aws_sfn_state_machine" "this" {
     redshift_target_table       = var.redshift_target_table
     redshift_staging_table      = var.redshift_staging_table
     copy_role_arn               = var.copy_role_arn
+    redshift_loader_lambda_arn  = var.redshift_loader_lambda_arn
     quarantine_prefix           = var.quarantine_prefix
   })
 

@@ -13,6 +13,11 @@ output "lambda_validator_role_arn" {
   value       = aws_iam_role.lambda_validator.arn
 }
 
+output "lambda_redshift_loader_role_arn" {
+  description = "ARN of the Redshift loader Lambda role."
+  value       = aws_iam_role.lambda_redshift_loader.arn
+}
+
 output "glue_role_arn" {
   description = "ARN of the Glue execution role."
   value       = aws_iam_role.glue.arn

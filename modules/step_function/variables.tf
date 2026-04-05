@@ -64,6 +64,11 @@ variable "copy_role_arn" {
   type        = string
 }
 
+variable "redshift_loader_lambda_arn" {
+  description = "ARN of the Redshift loader Lambda."
+  type        = string
+}
+
 variable "quarantine_prefix" {
   description = "S3 quarantine prefix."
   type        = string

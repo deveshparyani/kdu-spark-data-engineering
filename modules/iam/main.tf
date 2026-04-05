@@ -5,9 +5,11 @@ locals {
   redshift_secret_arn_pattern = "arn:aws:secretsmanager:${var.region}:${var.account_id}:secret:${var.redshift_secret_name}*"
   redshift_workgroup_arn      = "arn:aws:redshift-serverless:${var.region}:${var.account_id}:workgroup/${var.redshift_workgroup_name}"
   config_validator_lambda_arn = "arn:aws:lambda:${var.region}:${var.account_id}:function:${var.config_validator_lambda_name}"
+  redshift_loader_lambda_arn  = "arn:aws:lambda:${var.region}:${var.account_id}:function:${var.redshift_loader_lambda_name}"
   upload_lambda_dlq_arn       = "arn:aws:sqs:${var.region}:${var.account_id}:${var.upload_lambda_name}-dlq"
   adscribe_lambda_dlq_arn     = "arn:aws:sqs:${var.region}:${var.account_id}:${var.adscribe_lambda_name}-dlq"
   validator_lambda_dlq_arn    = "arn:aws:sqs:${var.region}:${var.account_id}:${var.config_validator_lambda_name}-dlq"
+  redshift_loader_dlq_arn     = "arn:aws:sqs:${var.region}:${var.account_id}:${var.redshift_loader_lambda_name}-dlq"
   raw_objects_arn             = "${var.bucket_arn}/${trim(var.raw_prefix, "/")}/*"
   processed_objects_arn       = "${var.bucket_arn}/${trim(var.processed_prefix, "/")}/*"
   curated_objects_arn         = "${var.bucket_arn}/${trim(var.curated_prefix, "/")}/*"
@@ -271,6 +273,65 @@ resource "aws_iam_role_policy" "lambda_validator" {
   })
 }
 
+resource "aws_iam_role" "lambda_redshift_loader" {
+  name               = var.lambda_redshift_loader_role_name
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+  tags               = merge(var.tags, { Name = var.lambda_redshift_loader_role_name })
+}
+
+resource "aws_iam_role_policy" "lambda_redshift_loader" {
+  name = "${var.lambda_redshift_loader_role_name}-policy"
+  role = aws_iam_role.lambda_redshift_loader.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "WriteLambdaLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${var.region}:${var.account_id}:*"
+      },
+      {
+        Sid    = "ExecuteRedshiftStatements"
+        Effect = "Allow"
+        Action = [
+          "redshift-data:BatchExecuteStatement",
+          "redshift-data:ExecuteStatement",
+          "redshift-data:DescribeStatement",
+          "redshift-data:CancelStatement"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "ReadRedshiftSecret"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = local.redshift_secret_arn_pattern
+      },
+      {
+        Sid      = "SendToLambdaDlq"
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = local.redshift_loader_dlq_arn
+      },
+      {
+        Sid    = "PublishTracingData"
+        Effect = "Allow"
+        Action = [
+          "xray:PutTraceSegments",
+          "xray:PutTelemetryRecords"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_iam_role" "glue" {
   name               = var.glue_role_name
   assume_role_policy = data.aws_iam_policy_document.glue_assume_role.json
@@ -364,6 +425,12 @@ resource "aws_iam_role_policy" "step_function" {
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
         Resource = local.config_validator_lambda_arn
+      },
+      {
+        Sid      = "InvokeRedshiftLoader"
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = local.redshift_loader_lambda_arn
       },
       {
         Sid    = "RunGlueJobs"
