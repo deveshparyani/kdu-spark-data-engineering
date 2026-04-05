@@ -1,0 +1,11 @@
+environment                  = "dev"
+aws_region                   = "ap-southeast-1"
+adscribe_api_url             = "https://api.adscribe.example.com/v1/exports/daily"
+adscribe_secret_string       = "{\"api_key\":\"replace-me\",\"client\":\"demo-client\"}"
+alert_email                  = "data-platform-dev@example.com"
+redshift_publicly_accessible = true
+default_config_version       = "v1"
+silver_number_of_workers     = 2
+gold_number_of_workers       = 2
+silver_max_concurrent_runs   = 1
+gold_max_concurrent_runs     = 1
