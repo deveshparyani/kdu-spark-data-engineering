@@ -68,6 +68,11 @@ variable "dynamodb_table_arn" {
   type        = string
 }
 
+variable "readiness_table_arn" {
+  description = "DynamoDB readiness table ARN."
+  type        = string
+}
+
 variable "lock_table_arn" {
   description = "DynamoDB lock table ARN."
   type        = string

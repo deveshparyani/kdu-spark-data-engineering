@@ -1,0 +1,228 @@
+# Viewstack ETL config for client beta.
+# Upload this file to:
+# s3://<data-lake-bucket>/configs/client=beta/v1.yaml
+#
+# Expected raw files:
+# - raw/client=beta/file_type=shows_and_codes/creator_beta_shows_and_codes.csv
+# - raw/client=beta/file_type=sales/creator_beta_sales.csv
+
+pipeline:
+  name: viewstack
+  schema_version: v1
+
+client:
+  id: beta
+  description: "Sales enriched by shows_and_codes, with segment-split order logic."
+
+source_format: csv
+partition_column: date
+date_column: date
+
+rename_columns:
+  Date: date_raw
+  Show: show
+  Revenue: revenue_raw
+  Orders: orders_raw
+  New: new_raw
+  Lapsed: lapsed_raw
+  Active: active_raw
+
+cleaning_rules:
+  show: lowercase
+
+joins:
+  - name: sales_to_shows_codes
+    path: "s3://<data-lake-bucket>/raw/client=beta/file_type=shows_and_codes/"
+    format: csv
+    keys:
+      - show
+    how: left
+    normalization:
+      trim: true
+      lowercase: true
+    quarantine_on_unmatched: true
+    quarantine_reason: unmatched_show_in_shows_and_codes
+
+transformations:
+  cast_columns: {}
+  fill_nulls:
+    new_raw: 0
+    lapsed_raw: 0
+    active_raw: 0
+  derived_columns:
+    - name: date
+      expression: >
+        COALESCE(
+          to_date(date_raw, 'yyyy-MM-dd'),
+          to_date(date_raw, 'MM/dd/yyyy'),
+          to_date(date_raw, 'M/d/yyyy'),
+          to_date(date_raw, 'dd-MM-yyyy'),
+          to_date(date_raw, 'dd/MM/yyyy'),
+          to_date(date_raw)
+        )
+    - name: revenue
+      expression: "CAST(regexp_replace(trim(revenue_raw), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: orders
+      expression: "CAST(regexp_replace(trim(orders_raw), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: New
+      expression: "CAST(regexp_replace(trim(COALESCE(new_raw, '0')), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: Lapsed
+      expression: "CAST(regexp_replace(trim(COALESCE(lapsed_raw, '0')), '[^0-9.\\-]', '') AS DOUBLE)"
+    - name: Active
+      expression: "CAST(regexp_replace(trim(COALESCE(active_raw, '0')), '[^0-9.\\-]', '') AS DOUBLE)"
+    # Count the number of active segments where the value is greater than zero.
+    - name: active_segment_count
+      expression: >
+        (CASE WHEN COALESCE(New, 0) > 0 THEN 1 ELSE 0 END) +
+        (CASE WHEN COALESCE(Lapsed, 0) > 0 THEN 1 ELSE 0 END) +
+        (CASE WHEN COALESCE(Active, 0) > 0 THEN 1 ELSE 0 END)
+    # Split Orders equally across all active segments.
+    - name: split_order_value
+      expression: "CASE WHEN active_segment_count > 0 THEN orders / active_segment_count ELSE 0 END"
+    - name: new_orders
+      expression: "CASE WHEN COALESCE(New, 0) > 0 THEN split_order_value ELSE 0 END"
+    - name: lapsed_orders
+      expression: "CASE WHEN COALESCE(Lapsed, 0) > 0 THEN split_order_value ELSE 0 END"
+    - name: active_orders
+      expression: "CASE WHEN COALESCE(Active, 0) > 0 THEN split_order_value ELSE 0 END"
+    - name: client_id
+      expression: "'beta'"
+  filter_expressions:
+    - "date IS NOT NULL"
+    - "show IS NOT NULL"
+    - "ROUND(new_orders + lapsed_orders + active_orders, 6) = ROUND(orders, 6)"
+
+drop_columns: []
+
+aggregation:
+  group_by:
+    - date
+    - discount_code
+  metrics:
+    - column: revenue
+      function: sum
+      alias: revenue
+    - column: new_orders
+      function: sum
+      alias: new_orders
+    - column: lapsed_orders
+      function: sum
+      alias: lapsed_orders
+    - column: active_orders
+      function: sum
+      alias: active_orders
+
+gold_aggregations:
+  group_by:
+    - date
+    - discount_code
+  metrics:
+    - column: revenue
+      function: sum
+      alias: revenue
+    - column: new_orders
+      function: sum
+      alias: new_orders
+    - column: lapsed_orders
+      function: sum
+      alias: lapsed_orders
+    - column: active_orders
+      function: sum
+      alias: active_orders
+
+common_cleaning:
+  date_parsing_rules:
+    target_column: date
+    accepted_formats:
+      - yyyy-MM-dd
+      - MM/dd/yyyy
+      - M/d/yyyy
+      - dd-MM-yyyy
+      - dd/MM/yyyy
+  numeric_cleaning:
+    target_columns:
+      - revenue_raw
+      - orders_raw
+      - new_raw
+      - lapsed_raw
+      - active_raw
+    remove_currency_symbols: true
+    remove_thousands_separators: true
+    normalize_decimal_separator: "."
+  text_normalization:
+    trim_columns:
+      - show
+      - discount_code
+    lowercase_columns:
+      - show
+      - discount_code
+  missing_value_strategy:
+    drop_rows_when_missing:
+      - date_raw
+      - show
+      - orders_raw
+    fill_defaults:
+      new_raw: 0
+      lapsed_raw: 0
+      active_raw: 0
+
+quarantine_rules:
+  - name: unmatched_shows_codes
+    condition: "discount_code IS NULL"
+    reason: unmatched_show_in_shows_and_codes
+  - name: segment_split_mismatch
+    condition: "ROUND(new_orders + lapsed_orders + active_orders, 6) <> ROUND(orders, 6)"
+    reason: segment_split_mismatch
+
+post_processing:
+  column_renaming:
+    date: date
+    client_id: client_id
+    revenue: revenue
+    orders: orders
+    discount_code: discount_code
+  sorting_rules:
+    - column: date
+      direction: asc
+    - column: discount_code
+      direction: asc
+  filtering_rules:
+    - "discount_code IS NOT NULL"
+
+outputs:
+  loaded_path: "s3://<data-lake-bucket>/processed/client=beta/"
+  quarantine_path: "s3://<data-lake-bucket>/quarantine/client=beta/"
+  loaded_schema:
+    - name: date
+      type: date
+    - name: discount_code
+      type: string
+    - name: revenue
+      type: double
+    - name: new_orders
+      type: double
+    - name: lapsed_orders
+      type: double
+    - name: active_orders
+      type: double
+    - name: client_id
+      type: string
+  quarantine_schema:
+    - name: date
+      type: string
+    - name: show
+      type: string
+    - name: orders
+      type: string
+    - name: New
+      type: string
+    - name: Lapsed
+      type: string
+    - name: Active
+      type: string
+    - name: revenue
+      type: string
+    - name: quarantine_reason
+      type: string
+    - name: client_id
+      type: string

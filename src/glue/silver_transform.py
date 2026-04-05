@@ -108,7 +108,7 @@ def load_dataset(spark, source_uri, file_format):
 
     reader = spark.read
     if format_name == "csv":
-        return reader.option("header", True).option("inferSchema", True).csv(source_uri)
+        return reader.option("header", True).option("inferSchema", False).csv(source_uri)
     if format_name == "parquet":
         return reader.parquet(source_uri)
     return reader.json(source_uri)
